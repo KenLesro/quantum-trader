@@ -253,5 +253,3 @@ if run_btn:
     # 原始数据
     with st.expander("查看历史数据"):
         st.dataframe(df.tail(20))
-
-
