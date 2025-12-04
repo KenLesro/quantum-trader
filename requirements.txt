@@ -1,1 +1,8 @@
-streamlityfinancepandasnumpyscipytorchplotlyscikit-learn
+streamlit
+yfinance
+pandas
+numpy
+scipy
+torch
+plotly
+scikit-learn
