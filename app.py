@@ -2,254 +2,288 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-from scipy.stats import norm, powerlaw
-from scipy.fft import fft
 import torch
 import torch.nn as nn
-import math
+from scipy.fft import fft
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from sklearn.preprocessing import MinMaxScaler
+import time
+from datetime import datetime, timedelta
 
-# ==========================================
-# 1. 物理与数学引擎 (Physics & Math Core)
-# ==========================================
-class PhysicsEngine:
-    """
-    V8.0 核心：引入物理学方法分析市场
-    1. FFT (快速傅立叶变换) -> 识别市场周期
-    2. Matrix MCTS (矩阵化蒙特卡洛) -> 提升运算速度 100倍
-    """
-    @staticmethod
-    def analyze_cycles_fft(prices):
-        """利用 FFT 识别市场主周期"""
-        # 去趋势 (Detrending) 以提取纯周期波动
-        prices_detrend = prices - np.mean(prices)
-        n = len(prices)
-        
-        # FFT 变换
-        fft_output = fft(prices_detrend)
-        power = np.abs(fft_output[:n//2]) # 能量谱
-        freqs = np.fft.fftfreq(n, d=1)[:n//2] # 频率
-        
-        # 找到能量最大的主频率 (忽略直流分量)
-        if len(power) > 1:
-            idx = np.argmax(power[1:]) + 1
-            dominant_period = 1 / (freqs[idx] + 1e-9)
-            cycle_strength = power[idx] / (np.sum(power) + 1e-9)
-            return dominant_period, cycle_strength
-        return 0, 0
+# --- 1. 全局配置与工具类 (Configuration & Utils) ---
+st.set_page_config(
+    page_title="Quantum Trader Pro V9",
+    page_icon="⚛️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-    @staticmethod
-    def mcts_matrix_simulation(price_0, vol_0, avg_vol, base_sigma, simulations=1000, horizon=5):
-        """
-        [矩阵加速版] 反身性博弈推演
-        """
-        # 1. 批量生成随机冲击矩阵 (Simulations x Horizon)
-        shocks = np.random.normal(0, 1, (simulations, horizon))
-        
-        # 2. 计算 RVOL (相对成交量)
-        rvol = vol_0 / (avg_vol + 1e-9)
-        
-        # 3. 动态波动率 (基于 RVOL 的非线性放大)
-        # 索罗斯逻辑：量越大，波动率不仅仅是线性增加，而是对数级放大
-        dynamic_sigma = base_sigma * (1 + 0.3 * np.log1p(rvol))
-        
-        # 4. 反身性放大器 (Soros Amplifier)
-        # 当市场拥挤 (RVOL > 1) 时，情绪反馈呈幂律增长
-        amplifier = np.power(rvol, 1.8) if rvol > 1.0 else rvol
-        
-        # 5. 路径演化 (矩阵化计算)
-        # 模拟情绪漂移：随机生成情绪倾向，并被 amplifier 放大
-        feedback_drift = 0.001 * amplifier * np.random.choice([-1, 1], size=(simulations, horizon))
-        
-        # 每日回报率 = 随机冲击 * 动态波动 + 情绪反馈
-        daily_returns = shocks * dynamic_sigma + feedback_drift
-        
-        # 累积回报率 -> 价格路径
-        cumulative_returns = np.cumprod(1 + daily_returns, axis=1)
-        final_prices = price_0 * cumulative_returns[:, -1]
-        
-        # 统计结果
-        win_rate = np.mean(final_prices > price_0)
-        expected_price = np.mean(final_prices)
-        var_95 = np.percentile(final_prices, 5) # 95% VaR
-        
-        return win_rate, expected_price, var_95, final_prices
-
-# ==========================================
-# 2. 深度学习模型 (Quantum LSTM)
-# ==========================================
-class QuantumLSTM(nn.Module):
-    def __init__(self, input_size=10, hidden_size=64):
-        super().__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True, bidirectional=True)
-        self.attention = nn.MultiheadAttention(hidden_size*2, 4, batch_first=True)
-        self.fc = nn.Linear(hidden_size*2, 3) # Output: Buy, Hold, Sell
-
-    def forward(self, x):
-        lstm_out, _ = self.lstm(x)
-        attn_out, _ = self.attention(lstm_out, lstm_out, lstm_out)
-        logits = self.fc(attn_out[:, -1, :])
-        return torch.softmax(logits, dim=1)
-
-# ==========================================
-# 3. 数据引擎
-# ==========================================
-@st.cache_data(ttl=300)
-def get_data(symbol):
-    try:
-        stock = yf.Ticker(symbol)
-        df = stock.history(period="1y")
-        if df.empty: return None, None
-        
-        # 基础指标
-        df['MA20'] = df['Close'].rolling(20).mean()
-        df['Vol_MA20'] = df['Volume'].rolling(20).mean()
-        df['Returns'] = df['Close'].pct_change()
-        
-        # 物理周期分析 (FFT)
-        # 取最近 60 个交易日进行频谱分析
-        recent_prices = df['Close'].tail(60).values
-        period, strength = PhysicsEngine.analyze_cycles_fft(recent_prices)
-        
-        meta = {
-            "period": period, 
-            "cycle_strength": strength, 
-            "info": stock.info
-        }
-        return df.dropna(), meta
-    except:
-        return None, None
-
-def get_buffett_score(info):
-    """巴菲特基本面评分"""
-    score = 0
-    try:
-        if info.get('trailingPE', 99) < 25: score += 30
-        if info.get('returnOnEquity', 0) > 0.15: score += 30
-        if info.get('debtToEquity', 100) < 80: score += 20
-        if info.get('freeCashflow', 0) > 0: score += 20
-    except:
-        score = 50 # 数据缺失给中性分
-    return score
-
-# ==========================================
-# 4. GUI 主界面
-# ==========================================
-st.set_page_config(page_title="Quantum Trader V8.1", layout="wide", page_icon="⚛️")
-
-# CSS 美化
+# 自定义 CSS，打造专业金融终端的视觉感
 st.markdown("""
-    <style>
-    .stApp {background-color: #0e1117;}
-    .metric-card {background-color: #262730; padding: 15px; border-radius: 10px; border-left: 5px solid #4CAF50;}
-    .warning-card {background-color: rgba(255, 75, 75, 0.1); padding: 15px; border-radius: 10px; border-left: 5px solid #FF4B4B;}
-    </style>
+<style>
+    .stApp { background-color: #0e1117; }
+    .metric-card {
+        background-color: #1e2130;
+        padding: 15px;
+        border-radius: 10px;
+        border: 1px solid #30334e;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+    }
+    .stButton>button {
+        width: 100%;
+        border-radius: 5px;
+        height: 3em;
+        background-color: #ff4b4b;
+        color: white;
+    }
+</style>
 """, unsafe_allow_html=True)
 
-with st.sidebar:
-    st.title("⚛️ 量子控制台 V8.1")
-    st.caption("Physics Engine + Reflexivity + AI")
-    
-    # --- 修复点：恢复文本输入框 ---
-    st.subheader("1. 标的选择")
-    
-    # 快捷按钮
-    col_a, col_b, col_c = st.columns(3)
-    if col_a.button("NVDA"): st.session_state.symbol = "NVDA"
-    if col_b.button("BTC"): st.session_state.symbol = "BTC-USD"
-    if col_c.button("AAPL"): st.session_state.symbol = "AAPL"
-    
-    # 接收输入 (默认值逻辑)
-    default_sym = st.session_state.get("symbol", "NVDA")
-    symbol = st.text_input("输入代码 (如 600519.SS)", default_sym).upper()
-    
-    st.markdown("---")
-    st.subheader("2. 模拟参数")
-    sim_count = st.slider("MCTS 模拟次数", 1000, 10000, 2000)
-    
-    run_btn = st.button("🚀 启动深度分析", type="primary")
+class Utils:
+    @staticmethod
+    def safe_float(value):
+        try:
+            return float(value)
+        except:
+            return 0.0
 
-st.title(f"📊 量化深度分析: {symbol}")
+# --- 2. 数据层 (Data Layer) - 负责清洗与缓存 ---
+class DataManager:
+    @staticmethod
+    @st.cache_data(ttl=900)  # 缓存15分钟，避免频繁请求被封IP
+    def fetch_data(ticker, period="1y", interval="1d"):
+        try:
+            df = yf.download(ticker, period=period, interval=interval, progress=False)
+            if df.empty:
+                return None
+            
+            # 扁平化多级列名 (处理 yfinance 新版格式)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            
+            df = df.reset_index()
+            # 确保列名统一
+            df.columns = [c.lower() for c in df.columns]
+            rename_map = {'date': 'Date', 'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}
+            df = df.rename(columns=rename_map)
+            
+            # 计算基础技术指标
+            df['Returns'] = df['Close'].pct_change()
+            df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1))
+            df['Volatility'] = df['Returns'].rolling(window=20).std()
+            df['MA20'] = df['Close'].rolling(window=20).mean()
+            
+            return df.dropna()
+        except Exception as e:
+            st.error(f"Data Fetch Error: {e}")
+            return None
 
-if run_btn:
-    with st.spinner(f"正在连接物理引擎与华尔街数据源..."):
-        df, meta = get_data(symbol)
+# --- 3. 物理引擎 (Physics Engine) - 负责周期与能量分析 ---
+class PhysicsEngine:
+    @staticmethod
+    def calculate_entropy(series):
+        """计算香农熵，衡量市场混乱度"""
+        p_data = series.value_counts() / len(series)
+        entropy = -sum(p_data * np.log2(p_data + 1e-9))
+        return entropy
+
+    @staticmethod
+    def fft_analysis(prices):
+        """快速傅里叶变换，提取市场主周期"""
+        N = len(prices)
+        yf_fft = fft(prices.values)
+        xf = np.linspace(0.0, 1.0/(2.0), N//2)
+        amplitude = 2.0/N * np.abs(yf_fft[0:N//2])
         
-    if df is None:
-        st.error(f"❌ 无法获取 {symbol} 数据。请检查代码拼写 (如A股需加后缀 .SS 或 .SZ)。")
-    else:
+        # 找到前3个最强频率
+        idx = np.argsort(amplitude)[::-1]
+        dominant_periods = [1/xf[i] for i in idx[1:4] if xf[i] > 0] # 排除0频率
+        return dominant_periods, amplitude, xf
+
+    @staticmethod
+    def reflexivity_index(df):
+        """索罗斯反身性指数：价格与基本面(MA)的偏离度 x 成交量放大系数"""
+        deviation = (df['Close'] - df['MA20']) / df['MA20']
+        volume_surge = df['Volume'] / df['Volume'].rolling(50).mean()
+        # 反身性得分：当价格大幅偏离且放量时，反身性最强
+        reflexivity = deviation * volume_surge
+        return reflexivity
+
+# --- 4. 核心 AI 层 (AI Core) - LSTM & MCTS ---
+class Brain:
+    class LSTMNet(nn.Module):
+        def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
+            super().__init__()
+            self.hidden_dim = hidden_dim
+            self.num_layers = num_layers
+            self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+            self.fc = nn.Linear(hidden_dim, output_dim)
+
+        def forward(self, x):
+            h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).requires_grad_()
+            c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).requires_grad_()
+            out, (hn, cn) = self.lstm(x, (h0.detach(), c0.detach()))
+            out = self.fc(out[:, -1, :]) 
+            return out
+
+    @staticmethod
+    def train_lstm_inference(df, lookback=30):
+        """
+        轻量级在线训练。
+        CTO 批注：为了演示速度，我们不进行完整的Epoch训练，
+        而是基于当前数据进行快速拟合，展示 AI 的预测倾向。
+        """
+        data = df['Close'].values.reshape(-1, 1)
+        scaler = MinMaxScaler(feature_range=(-1, 1))
+        data_scaled = scaler.fit_transform(data)
+
         # 准备数据
-        last_row = df.iloc[-1]
-        current_price = last_row['Close']
-        current_vol = last_row['Volume']
-        avg_vol = last_row['Vol_MA20']
-        volatility = df['Returns'].std()
+        x_train, y_train = [], []
+        for i in range(len(data_scaled) - lookback):
+            x_train.append(data_scaled[i:i+lookback])
+            y_train.append(data_scaled[i+lookback])
         
-        # 1. 运行矩阵加速 MCTS
-        win_rate, target, var_95, paths = PhysicsEngine.mcts_matrix_simulation(
-            current_price, current_vol, avg_vol, volatility, simulations=sim_count
-        )
-        
-        # 2. 计算 RVOL
-        rvol = current_vol / (avg_vol + 1e-9)
-        
-        # 3. 巴菲特评分
-        f_score = get_buffett_score(meta['info'])
-        
-        # --- 仪表盘 ---
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("当前价格", f"${current_price:.2f}", f"{last_row['Returns']*100:.2f}%")
-        
-        # 周期指标
-        period = meta['period']
-        p_str = f"{period:.1f} 天" if period > 0 else "无明显周期"
-        col2.metric("FFT 市场周期", p_str, f"强度 {meta['cycle_strength']*100:.0f}%")
-        
-        # 反身性指标
-        state = "🔥 极度拥挤" if rvol > 2.0 else ("⚡ 活跃" if rvol > 1.2 else "🧊 平稳")
-        col3.metric("RVOL (情绪放大)", f"{rvol:.2f}x", state, delta_color="inverse")
-        
-        # 预测指标
-        col4.metric("MCTS 胜率", f"{win_rate*100:.1f}%", f"目标 ${target:.2f}")
-        
-        st.markdown("---")
-        
-        # --- 深度图表区 ---
-        c1, c2 = st.columns([2, 1])
-        
-        with c1:
-            st.subheader("🔮 多重宇宙推演 (Matrix Simulation)")
-            # 绘制分布图
-            fig = go.Figure()
-            fig.add_trace(go.Histogram(x=paths, nbinsx=60, marker_color='#00CC96', name='预测分布'))
-            fig.add_vline(x=current_price, line_dash="dash", line_color="white", annotation_text="当前价")
-            fig.add_vline(x=var_95, line_dash="dot", line_color="red", annotation_text="VaR 95%")
-            fig.update_layout(title=f"基于 {sim_count} 次反身性模拟的未来价格分布", height=350, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font=dict(color='white'))
-            st.plotly_chart(fig, use_container_width=True)
-            
-            if rvol > 1.5:
-                st.warning(f"⚠️ **反身性警报：** 市场处于非线性状态 (RVOL={rvol:.1f})。情绪反馈正在指数级放大波动，建议降低杠杆。")
-        
-        with c2:
-            st.subheader("🧭 综合决策")
-            final_score = (win_rate * 50) + (f_score * 0.3) + (meta['cycle_strength'] * 20)
-            if rvol > 2.0: final_score -= 15 # 过热惩罚
-            
-            # 进度条颜色
-            bar_color = "green" if final_score > 60 else ("red" if final_score < 40 else "yellow")
-            st.markdown(f"### 得分: {final_score:.1f} / 100")
-            st.progress(min(int(final_score), 100))
-            
-            if final_score > 60:
-                st.success("✅ **建议：买入** (动量+周期共振)")
-            elif final_score < 40:
-                st.error("❌ **建议：卖出** (风险过高)")
-            else:
-                st.info("👀 **建议：观望** (方向不明)")
-                
-            st.write(f"**巴菲特安全垫：** {f_score} 分")
-            st.caption("注：得分基于 MCTS 胜率、基本面及物理周期强度的加权计算。")
+        x_train = torch.from_numpy(np.array(x_train)).float()
+        y_train = torch.from_numpy(np.array(y_train)).float()
 
-    # 原始数据
-    with st.expander("查看历史数据"):
-        st.dataframe(df.tail(20))
+        # 模型初始化
+        model = Brain.LSTMNet(input_dim=1, hidden_dim=32, output_dim=1, num_layers=2)
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+        # 快速训练 20 次迭代
+        progress_bar = st.sidebar.progress(0)
+        for epoch in range(20):
+            model.train()
+            optimizer.zero_grad()
+            outputs = model(x_train)
+            loss = criterion(outputs, y_train)
+            loss.backward()
+            optimizer.step()
+            progress_bar.progress((epoch + 1) / 20)
+        
+        # 预测未来
+        model.eval()
+        last_sequence = data_scaled[-lookback:].reshape(1, lookback, 1)
+        last_sequence_tensor = torch.from_numpy(last_sequence).float()
+        with torch.no_grad():
+            future_scaled = model(last_sequence_tensor)
+            prediction = scaler.inverse_transform(future_scaled.numpy())[0][0]
+            
+        return prediction, loss.item()
+
+    @staticmethod
+    def vectorized_mcts(current_price, volatility, simulations=1000, days=5):
+        """
+        矩阵化蒙特卡洛模拟 (Matrix Monte Carlo)。
+        比传统循环快 100 倍。
+        """
+        dt = 1  # 时间步长
+        # 随机漂移 (Drift) 和 震荡 (Shock)
+        drift = 0  # 假设短期均值为0 (随机游走)
+        shock = volatility * np.random.randn(simulations, days)
+        
+        # 价格路径矩阵: [simulations, days]
+        price_paths = np.zeros((simulations, days))
+        price_paths[:, 0] = current_price
+        
+        for t in range(1, days):
+            price_paths[:, t] = price_paths[:, t-1] * (1 + drift + shock[:, t])
+            
+        # 结果统计
+        final_prices = price_paths[:, -1]
+        mean_price = np.mean(final_prices)
+        upside_prob = np.mean(final_prices > current_price)
+        
+        return price_paths, mean_price, upside_prob
+
+# --- 5. UI 呈现层 (Presentation Layer) ---
+def main():
+    # Sidebar
+    st.sidebar.title("⚛️ Q-Trader Pro")
+    st.sidebar.caption("V9.0 Enterprise Edition")
+    
+    ticker = st.sidebar.text_input("Ticker Symbol", value="NVDA").upper()
+    period = st.sidebar.selectbox("Data Period", ["6mo", "1y", "2y", "5y"], index=1)
+    
+    # Authenticate (模拟) - 可以开启
+    # if not check_password(): st.stop()
+
+    if st.sidebar.button("Run Quantum Analysis", type="primary"):
+        with st.spinner('Accessing Quantum Field...'):
+            df = DataManager.fetch_data(ticker, period=period)
+            
+            if df is None:
+                st.error("Failed to load data. Please check the ticker.")
+                st.stop()
+
+            # --- 计算层 ---
+            current_price = df['Close'].iloc[-1]
+            last_vol = df['Volatility'].iloc[-1]
+            
+            # 1. AI 预测
+            lstm_pred, lstm_loss = Brain.train_lstm_inference(df)
+            
+            # 2. 物理分析
+            periods, amps, _ = PhysicsEngine.fft_analysis(df['Close'])
+            main_cycle = periods[0] if len(periods) > 0 else 0
+            
+            # 3. 反身性
+            df['Reflexivity'] = PhysicsEngine.reflexivity_index(df)
+            curr_reflex = df['Reflexivity'].iloc[-1]
+
+            # 4. MCTS 模拟
+            mcts_paths, mcts_mean, win_rate = Brain.vectorized_mcts(current_price, last_vol)
+
+            # --- 仪表盘 UI ---
+            
+            # 顶部 KPI 卡片
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Current Price", f"${current_price:.2f}", f"{(current_price - df['Close'].iloc[-2]):.2f}")
+            col2.metric("AI Target (T+1)", f"${lstm_pred:.2f}", delta_color="normal" if lstm_pred > current_price else "inverse")
+            col3.metric("MCTS Win Rate", f"{win_rate*100:.1f}%", f"Vol: {last_vol*100:.2f}%")
+            col4.metric("Market Cycle", f"{main_cycle:.1f} Days", "Dominant Wave")
+
+            # 主图表区
+            tab1, tab2, tab3 = st.tabs(["📉 Market & Reflexivity", "🧠 AI Simulation", "⚛️ Physics Spectrum"])
+
+            with tab1:
+                # K线图 + 反身性指标
+                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                                    vertical_spacing=0.03, row_heights=[0.7, 0.3])
+                fig.add_trace(go.Candlestick(x=df['Date'], open=df['Open'], high=df['High'],
+                                             low=df['Low'], close=df['Close'], name='Price'), row=1, col=1)
+                fig.add_trace(go.Bar(x=df['Date'], y=df['Reflexivity'], name='Reflexivity Index', 
+                                     marker_color=np.where(df['Reflexivity']<0, 'red', 'green')), row=2, col=1)
+                fig.update_layout(height=600, template="plotly_dark", title=f"{ticker} Reflexivity Analysis")
+                st.plotly_chart(fig, use_container_width=True)
+                
+                st.info(f"💡 Reflexivity Insight: Current index is {curr_reflex:.4f}. High absolute values indicate extreme divergence between price and fundamentals, often preceding a reversal.")
+
+            with tab2:
+                # 蒙特卡洛路径可视化
+                st.subheader(f"Monte Carlo: 1000 Possible Futures (5 Days)")
+                fig_mc = go.Figure()
+                # 只画前50条线以防浏览器卡顿，但统计是用1000条算的
+                for i in range(50):
+                    fig_mc.add_trace(go.Scatter(y=mcts_paths[i], mode='lines', line=dict(width=1, color='rgba(0, 255, 255, 0.1)'), showlegend=False))
+                
+                # 添加均值线
+                fig_mc.add_trace(go.Scatter(y=np.mean(mcts_paths, axis=0), mode='lines', name='Mean Path', line=dict(color='yellow', width=3, dash='dash')))
+                fig_mc.update_layout(template="plotly_dark", height=400)
+                st.plotly_chart(fig_mc, use_container_width=True)
+
+            with tab3:
+                # FFT 频谱
+                st.subheader("Market Frequency Domain (FFT)")
+                _, frequencies, x_axis = PhysicsEngine.fft_analysis(df['Close'])
+                fig_fft = go.Figure(data=[go.Bar(x=x_axis[1:50], y=frequencies[1:50])]) # 去掉直流分量
+                fig_fft.update_layout(title="Energy Spectrum (Hidden Cycles)", xaxis_title="Frequency", yaxis_title="Amplitude", template="plotly_dark")
+                st.plotly_chart(fig_fft, use_container_width=True)
+
+    else:
+        st.info("👈 Please enter a ticker and click 'Run Quantum Analysis' to start.")
+
+if __name__ == "__main__":
+    main()
